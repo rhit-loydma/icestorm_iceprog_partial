@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 #ifdef _WIN32
 #include <io.h> /* _setmode() */
@@ -480,6 +481,36 @@ static void flash_enable_quad()
 	fprintf(stderr, "SR2: %08x\n", data[1]);
 }
 
+static void identify_modified_chunks(FILE *src, FILE *dst, bool* arr, int block_size, int rw_offset) {
+	fseek(src, 0, SEEK_SET);
+	fseek(dst, rw_offset, SEEK_SET);
+	int subsector = 0;
+
+	while(true) {
+		unsigned char buffer_src[block_size];
+		size_t rc_src = fread(buffer_src, 1, block_size, src);
+		if (rc_src <= 0)
+			break;
+
+		unsigned char buffer_dst[block_size];
+		size_t rc_dst = fread(buffer_dst, 1, block_size, dst);
+		if (rc_dst <= 0)
+			break;
+
+		for (int i = 0; i < block_size; i++) {
+			if (buffer_src[i] != buffer_dst[i]) {
+				arr[subsector] = true;
+				break;
+			}
+		}
+		
+		subsector += 1;
+	}
+
+	fseek(src, 0, SEEK_SET);
+	fseek(dst, 0, SEEK_SET);
+}
+
 // ---------------------------------------------------------
 // iceprog implementation
 // ---------------------------------------------------------
@@ -507,10 +538,12 @@ static void help(const char *progname)
 	fprintf(stderr, "  -k                    keep flash in powered up state (i.e. skip power down command)\n");
 	fprintf(stderr, "  -v                    verbose output\n");
 	fprintf(stderr, "  -i [4,32,64]          select erase block size [default: 64k]\n");
+	fprintf(stderr, "  -T                    display the time it takes for each stage to finish\n");
 	fprintf(stderr, "\n");
 	fprintf(stderr, "Mode of operation:\n");
 	fprintf(stderr, "  [default]             write file contents to flash, then verify\n");
 	fprintf(stderr, "  -X                    write file contents to flash only\n");	
+	fprintf(stderr, "  -P <file>             write file contents to flash only where it differs from existing file on FPGA\n");	
 	fprintf(stderr, "  -r                    read first 256 kB from flash and write to file\n");
 	fprintf(stderr, "  -R <size in bytes>    read the specified number of bytes from flash\n");
 	fprintf(stderr, "                          (append 'k' to the argument for size in kilobytes,\n");
@@ -561,6 +594,11 @@ static void help(const char *progname)
 
 int main(int argc, char **argv)
 {
+	long total_start, total_end;
+    struct timeval total_timecheck;
+	gettimeofday(&total_timecheck, NULL);
+    total_start = (long)total_timecheck.tv_sec * 1000 + (long)total_timecheck.tv_usec / 1000;
+
 	/* used for error reporting */
 	const char *my_name = argv[0];
 	for (size_t i = 0; argv[0][i]; i++)
@@ -587,6 +625,13 @@ int main(int argc, char **argv)
 	const char *devstr = NULL;
 	int ifnum = 0;
 
+	bool partially_reconfigure = false;
+	const char *dst_filename = NULL;
+
+	bool display_time = false;
+	long start, end;
+    struct timeval timecheck;
+
 #ifdef _WIN32
 	_setmode(_fileno(stdin), _O_BINARY);
 	_setmode(_fileno(stdout), _O_BINARY);
@@ -600,7 +645,7 @@ int main(int argc, char **argv)
 	/* Decode command line parameters */
 	int opt;
 	char *endptr;
-	while ((opt = getopt_long(argc, argv, "d:i:I:rR:e:o:cbnStQvspXk", long_options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:i:I:rR:e:o:cbnStQvspXkP:T", long_options, NULL)) != -1) {
 		switch (opt) {
 		case 'd': /* device string */
 			devstr = optarg;
@@ -708,6 +753,13 @@ int main(int argc, char **argv)
 		case 'k': /* disable power down command */
 			disable_powerdown = true;
 			break;
+		case 'P':
+			partially_reconfigure = true;
+			dst_filename = optarg;
+			break;
+		case 'T':
+			display_time = true;
+			break;
 		case -2:
 			help(argv[0]);
 			return EXIT_SUCCESS;
@@ -719,7 +771,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Make sure that the combination of provided parameters makes sense */
-
+	// TODO: add anyhting for partial option (maybe 4kb reset and no offset)
 	if (read_mode + erase_mode + check_mode + prog_sram + !!test_mode > 1) {
 		fprintf(stderr, "%s: options `-r'/`-R', `-e`, `-c', `-S', and `-t' are mutually exclusive\n", my_name);
 		return EXIT_FAILURE;
@@ -755,6 +807,16 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	if (partially_reconfigure && (read_mode || check_mode || prog_sram || test_mode)) {
+		fprintf(stderr, "%s: option `-P' only valid in programming mode\n", my_name);
+		return EXIT_FAILURE;
+	}
+
+	if (partially_reconfigure && bulk_erase) {
+		fprintf(stderr, "%s: option `-b' not supported in partial reconfiguration mode\n", my_name);
+		return EXIT_FAILURE;
+	}
+
 	if (optind + 1 == argc) {
 		if (test_mode) {
 			fprintf(stderr, "%s: test mode doesn't take a file name\n", my_name);
@@ -776,9 +838,11 @@ int main(int argc, char **argv)
 
 	/* open input/output file in advance
 	   so we can fail before initializing the hardware */
-
 	FILE *f = NULL;
 	long file_size = -1;
+
+	FILE *dst = NULL;
+	bool chunk_differences[8] = {false};
 
 	if (test_mode) {
 		/* nop */;
@@ -850,12 +914,29 @@ int main(int argc, char **argv)
 				   start reading again */
 				fseek(f, 0, SEEK_SET);
 			}
+
+			if(partially_reconfigure) {
+				dst = fopen(dst_filename, "rb");
+				if (dst == NULL) {
+					fprintf(stderr, "%s: can't open '%s' for reading: ", my_name, optarg);
+					perror(0);
+					return EXIT_FAILURE;
+				}
+				identify_modified_chunks(f, dst, chunk_differences, erase_block_size << 10, rw_offset);
+				printf("Found differences in subsectors: ");
+				for(int i = 0; i < 8; i++) {
+					if (chunk_differences[i]) printf("%d ", i);
+				}
+				printf("\n");
+			}
 		}
 	}
 
 	// ---------------------------------------------------------
 	// Initialize USB connection to FT2232H
 	// ---------------------------------------------------------
+	gettimeofday(&timecheck, NULL);
+    start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
 
 	fprintf(stderr, "init..\n");
 
@@ -865,6 +946,11 @@ int main(int argc, char **argv)
 
 	flash_release_reset();
 	usleep(100000);
+
+	gettimeofday(&timecheck, NULL);
+    end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
+	if (display_time) printf("Time taken to init: %ld ms\n", (end - start));
+
 
 	if (test_mode)
 	{
@@ -932,6 +1018,8 @@ int main(int argc, char **argv)
 		// ---------------------------------------------------------
 		// Reset
 		// ---------------------------------------------------------
+		gettimeofday(&timecheck, NULL);
+    	start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
 
 		fprintf(stderr, "reset..\n");
 
@@ -945,6 +1033,9 @@ int main(int argc, char **argv)
 
 		flash_read_id();
 
+		gettimeofday(&timecheck, NULL);
+    	end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;;
+		if (display_time) printf("Time taken to reset: %ld ms\n", (end - start));
 
 		// ---------------------------------------------------------
 		// Program
@@ -968,6 +1059,8 @@ int main(int argc, char **argv)
 				}
 				else
 				{
+					gettimeofday(&timecheck, NULL);
+    				start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
 					fprintf(stderr, "file size: %ld\n", file_size);
 
 					int block_size = erase_block_size << 10;
@@ -976,30 +1069,38 @@ int main(int argc, char **argv)
 					int end_addr = (rw_offset + file_size + block_mask) & ~block_mask;
 
 					for (int addr = begin_addr; addr < end_addr; addr += block_size) {
-						flash_write_enable();
-						switch(erase_block_size) {
-							case 4:
-								flash_4kB_sector_erase(addr);
-								break;
-							case 32:
-								flash_32kB_sector_erase(addr);
-								break;
-							case 64:
-								flash_64kB_sector_erase(addr);
-								break;
+						if ((!partially_reconfigure) || chunk_differences[addr/block_size]) {
+							flash_write_enable();
+							switch(erase_block_size) {
+								case 4:
+									flash_4kB_sector_erase(addr);
+									break;
+								case 32:
+									flash_32kB_sector_erase(addr);
+									break;
+								case 64:
+									flash_64kB_sector_erase(addr);
+									break;
+							}
+							if (verbose) {
+								fprintf(stderr, "Status after block erase:\n");
+								flash_read_status();
+							}
+							flash_wait();
 						}
-						if (verbose) {
-							fprintf(stderr, "Status after block erase:\n");
-							flash_read_status();
-						}
-						flash_wait();
 					}
+
+					gettimeofday(&timecheck, NULL);
+    				end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
+					if (display_time) printf("Time taken to erase: %ld ms\n", (end - start));
 				}
 			}
-
 			if (!erase_mode)
 			{
+				gettimeofday(&timecheck, NULL);
+    			start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
 				fprintf(stderr, "programming..\n");
+				int block_size = erase_block_size << 10;
 
 				for (int rc, addr = 0; true; addr += rc) {
 					uint8_t buffer[256];
@@ -1007,17 +1108,23 @@ int main(int argc, char **argv)
 					rc = fread(buffer, 1, page_size, f);
 					if (rc <= 0)
 						break;
-					fprintf(stderr, "                      \r");
-					fprintf(stderr, "addr 0x%06X %3ld%%\r", rw_offset + addr, 100 * addr / file_size);
-					flash_write_enable();
-					flash_prog(rw_offset + addr, buffer, rc);
-					flash_wait();
+					if ((!partially_reconfigure) || chunk_differences[addr/block_size]) {
+						fprintf(stderr, "                      \r");
+						fprintf(stderr, "addr 0x%06X %3ld%%\r", rw_offset + addr, 100 * addr / file_size);
+						flash_write_enable();
+						flash_prog(rw_offset + addr, buffer, rc);
+						flash_wait();
+					}
 				}
 				fprintf(stderr, "                      \r");
 				fprintf(stderr, "done.\n");
 
 				/* seek to the beginning for second pass */
 				fseek(f, 0, SEEK_SET);
+
+				gettimeofday(&timecheck, NULL);
+    			end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
+				if (display_time) printf("Time taken to program: %ld ms\n", (end - start));
 			}
 		}
 
@@ -1037,6 +1144,9 @@ int main(int argc, char **argv)
 			fprintf(stderr, "                      \r");
 			fprintf(stderr, "done.\n");
 		} else if (!erase_mode && !disable_verify) {
+			gettimeofday(&timecheck, NULL);
+    		start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
+			
 			fprintf(stderr, "reading..\n");
 			for (int addr = 0; true; addr += 256) {
 				uint8_t buffer_flash[256], buffer_file[256];
@@ -1058,12 +1168,18 @@ int main(int argc, char **argv)
 
 			fprintf(stderr, "                      \r");
 			fprintf(stderr, "VERIFY OK\n");
+
+			gettimeofday(&timecheck, NULL);
+    		end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
+			if (display_time) printf("Time taken to verify: %ld ms\n", (end - start));
 		}
 
 
 		// ---------------------------------------------------------
 		// Reset
 		// ---------------------------------------------------------
+		gettimeofday(&timecheck, NULL);
+    	start = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;
 
 		if (!disable_powerdown)
 			flash_power_down();
@@ -1072,6 +1188,10 @@ int main(int argc, char **argv)
 		usleep(250000);
 
 		fprintf(stderr, "cdone: %s\n", get_cdone() ? "high" : "low");
+
+		gettimeofday(&timecheck, NULL);
+    	end = (long)timecheck.tv_sec * 1000 + (long)timecheck.tv_usec / 1000;;
+		if (display_time) printf("Time taken to reset: %ld ms\n", (end - start));
 	}
 
 	if (f != NULL && f != stdin && f != stdout)
@@ -1083,5 +1203,9 @@ int main(int argc, char **argv)
 
 	fprintf(stderr, "Bye.\n");
 	mpsse_close();
+
+	gettimeofday(&total_timecheck, NULL);
+    total_end = (long)total_timecheck.tv_sec * 1000 + (long)total_timecheck.tv_usec / 1000;
+	if (display_time) printf("Total of %ld milliseconds elapsed\n", (total_end - total_start));
 	return 0;
 }
